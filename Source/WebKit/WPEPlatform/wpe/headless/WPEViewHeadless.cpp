@@ -30,6 +30,7 @@
 #include <wtf/glib/GRefPtr.h>
 #include <wtf/glib/RunLoopSourcePriority.h>
 #include <wtf/glib/WTFGType.h>
+#include <math.h>
 
 /**
  * WPEViewHeadless:
@@ -40,8 +41,27 @@ struct _WPEViewHeadlessPrivate {
     GRefPtr<WPEBuffer> committedBuffer;
     GRefPtr<GSource> frameSource;
     gint64 lastFrameTime;
+    gfloat fps;
 };
 WEBKIT_DEFINE_FINAL_TYPE(WPEViewHeadless, wpe_view_headless, WPE_TYPE_VIEW, WPEView)
+
+enum {
+    PROP_0,
+    PROP_FPS,
+    N_PROPERTIES
+};
+
+#define PROP_FPS_DEFAULT 60.f
+#define PROP_FPS_MIN 0.00001f
+
+static GParamSpec* sObjProperties[N_PROPERTIES] = { nullptr, };
+
+enum {
+    BUFFER_AVAILABLE,
+    LAST_SIGNAL
+};
+
+static guint signals[LAST_SIGNAL] = { 0, };
 
 static GSourceFuncs frameSourceFuncs = {
     nullptr, // prepare
@@ -81,6 +101,7 @@ static void wpeViewHeadlessConstructed(GObject* object)
     }), nullptr);
 
     auto* priv = WPE_VIEW_HEADLESS(view)->priv;
+    priv->fps = PROP_FPS_DEFAULT;
     priv->frameSource = adoptGRef(g_source_new(&frameSourceFuncs, sizeof(GSource)));
     g_source_set_priority(priv->frameSource.get(), RunLoopSourcePriority::RunLoopTimer);
     g_source_set_name(priv->frameSource.get(), "WPE headless frame timer");
@@ -91,6 +112,7 @@ static void wpeViewHeadlessConstructed(GObject* object)
             wpe_view_buffer_released(view, priv->committedBuffer.get());
         priv->committedBuffer = WTFMove(priv->pendingBuffer);
         wpe_view_buffer_rendered(view, priv->committedBuffer.get());
+        priv->lastFrameTime = g_get_monotonic_time();
 
         if (g_source_is_destroyed(priv->frameSource.get()))
             return G_SOURCE_REMOVE;
@@ -98,6 +120,34 @@ static void wpeViewHeadlessConstructed(GObject* object)
     }, object, nullptr);
     g_source_attach(priv->frameSource.get(), g_main_context_get_thread_default());
     g_source_set_ready_time(priv->frameSource.get(), -1);
+}
+
+static void wpeViewHeadlessSetProperty(GObject* object, guint propId, const GValue* value, GParamSpec* paramSpec)
+{
+    auto* priv = WPE_VIEW_HEADLESS(object)->priv;
+
+    switch (propId) {
+    case PROP_FPS:
+        priv->fps = g_value_get_float(value);
+        break;
+    default:
+        G_OBJECT_WARN_INVALID_PROPERTY_ID(object, propId, paramSpec);
+        break;
+    }
+}
+
+static void wpeViewHeadlessGetProperty(GObject* object, guint propId, GValue* value, GParamSpec* paramSpec)
+{
+    auto* priv = WPE_VIEW_HEADLESS(object)->priv;
+
+    switch (propId) {
+    case PROP_FPS:
+        g_value_set_float(value, priv->fps);
+        break;
+    default:
+        G_OBJECT_WARN_INVALID_PROPERTY_ID(object, propId, paramSpec);
+        break;
+    }
 }
 
 static void wpeViewHeadlessDispose(GObject* object)
@@ -116,15 +166,23 @@ static gboolean wpeViewHeadlessRenderBuffer(WPEView* view, WPEBuffer* buffer, co
 {
     auto* priv = WPE_VIEW_HEADLESS(view)->priv;
     priv->pendingBuffer = buffer;
-    auto now = g_get_monotonic_time();
-    if (!priv->lastFrameTime)
-        priv->lastFrameTime = now;
-    auto next = priv->lastFrameTime + (G_USEC_PER_SEC / 60);
-    priv->lastFrameTime = now;
-    if (next <= now)
+
+    gint64 nextFrameTime = -1;
+    gfloat fps = priv->fps;
+    if (fps >= PROP_FPS_MIN) {
+        gint64 frameDuration = roundf(G_USEC_PER_SEC / fps);
+        if (priv->lastFrameTime)
+            nextFrameTime = priv->lastFrameTime + frameDuration;
+        else
+            nextFrameTime = g_get_monotonic_time() + frameDuration;
+    }
+
+    g_signal_emit(view, signals[BUFFER_AVAILABLE], 0, buffer);
+
+    if (nextFrameTime <= g_get_monotonic_time())
         g_source_set_ready_time(priv->frameSource.get(), 0);
     else
-        g_source_set_ready_time(priv->frameSource.get(), next);
+        g_source_set_ready_time(priv->frameSource.get(), nextFrameTime);
 
     return TRUE;
 }
@@ -133,10 +191,42 @@ static void wpe_view_headless_class_init(WPEViewHeadlessClass* viewHeadlessClass
 {
     GObjectClass* objectClass = G_OBJECT_CLASS(viewHeadlessClass);
     objectClass->constructed = wpeViewHeadlessConstructed;
+    objectClass->set_property = wpeViewHeadlessSetProperty;
+    objectClass->get_property = wpeViewHeadlessGetProperty;
     objectClass->dispose = wpeViewHeadlessDispose;
 
     WPEViewClass* viewClass = WPE_VIEW_CLASS(viewHeadlessClass);
     viewClass->render_buffer = wpeViewHeadlessRenderBuffer;
+
+    /**
+     * WPEViewHeadless::fps:
+     *
+     * The rendering targeted number of frames per second, set to 0 to render
+     * as fast as possible.
+     */
+    sObjProperties[PROP_FPS] = g_param_spec_float(
+        "fps",
+        nullptr, nullptr,
+        0.f, G_MAXFLOAT, PROP_FPS_DEFAULT,
+        WEBKIT_PARAM_READWRITE);
+
+    g_object_class_install_properties(objectClass, N_PROPERTIES, sObjProperties);
+
+    /**
+     * WPEViewHeadless::buffer-available:
+     * @view: a #WPEView
+     * @buffer: a #WPEBuffer
+     *
+     * Emitted to notify that a new frame buffer is available.
+     */
+    signals[BUFFER_AVAILABLE] = g_signal_new(
+        "buffer-available",
+        G_TYPE_FROM_CLASS(viewClass),
+        G_SIGNAL_RUN_LAST,
+        0, nullptr, nullptr,
+        g_cclosure_marshal_generic,
+        G_TYPE_NONE, 1,
+        WPE_TYPE_BUFFER);
 }
 
 /**
