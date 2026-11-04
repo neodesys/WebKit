@@ -200,23 +200,27 @@ void AudioDestinationGStreamer::initializePipeline()
         return;
     }
 
-    // Probe platform early on for a working audio output device in autoaudiosink.
-    auto nameView = StringView::fromLatin1(GST_OBJECT_NAME(m_audioSink.get()));
-    if (nameView.startsWith("autoaudiosink"_s)) {
-        g_signal_connect(m_audioSink.get(), "child-added", G_CALLBACK(+[](GstChildProxy*, GObject* object, gchar*, gpointer) {
-            if (GST_IS_AUDIO_BASE_SINK(object))
-                g_object_set(GST_AUDIO_BASE_SINK(object), "buffer-time", static_cast<gint64>(100000), nullptr);
-        }), nullptr);
+    if (GST_IS_AUDIO_BASE_SINK(m_audioSink.get()))
+        g_object_set(m_audioSink.get(), "buffer-time", static_cast<gint64>(100000), "slave-method", GST_AUDIO_BASE_SINK_SLAVE_NONE, nullptr);
+    else {
+        // Probe platform early on for a working audio output device in autoaudiosink.
+        auto nameView = StringView::fromLatin1(GST_OBJECT_NAME(m_audioSink.get()));
+        if (nameView.startsWith("autoaudiosink"_s)) {
+            g_signal_connect(m_audioSink.get(), "child-added", G_CALLBACK(+[](GstChildProxy*, GObject* object, gchar*, gpointer) {
+                if (GST_IS_AUDIO_BASE_SINK(object))
+                    g_object_set(object, "buffer-time", static_cast<gint64>(100000), "slave-method", GST_AUDIO_BASE_SINK_SLAVE_NONE, nullptr);
+            }), nullptr);
 
-        // Autoaudiosink does the real sink detection in the GST_STATE_NULL->READY transition
-        // so it's best to roll it to READY as soon as possible to ensure the underlying platform
-        // audiosink was loaded correctly.
-        GstStateChangeReturn stateChangeReturn = gst_element_set_state(m_audioSink.get(), GST_STATE_READY);
-        if (stateChangeReturn == GST_STATE_CHANGE_FAILURE) {
-            GST_ERROR("Failed to change autoaudiosink element state");
-            gst_element_set_state(m_audioSink.get(), GST_STATE_NULL);
-            m_audioSink = nullptr;
-            return;
+            // Autoaudiosink does the real sink detection in the GST_STATE_NULL->READY transition
+            // so it's best to roll it to READY as soon as possible to ensure the underlying platform
+            // audiosink was loaded correctly.
+            GstStateChangeReturn stateChangeReturn = gst_element_set_state(m_audioSink.get(), GST_STATE_READY);
+            if (stateChangeReturn == GST_STATE_CHANGE_FAILURE) {
+                GST_ERROR("Failed to change autoaudiosink element state");
+                gst_element_set_state(m_audioSink.get(), GST_STATE_NULL);
+                m_audioSink = nullptr;
+                return;
+            }
         }
     }
 
